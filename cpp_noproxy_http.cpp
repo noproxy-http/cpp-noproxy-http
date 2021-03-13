@@ -67,15 +67,18 @@ struct metadata {
 };
 
 struct request {
+    bool poisoned;
     void* handle;
     metadata meta;
     const char* data;
     size_t data_len;
 
-    request() { }
+    request(bool poisoned_in) :
+    poisoned(poisoned_in) { }
 
     request(void* handle_in, const char* metadata_in, int metadata_len_in, 
             const char* data_in, int data_len_in) :
+    poisoned(false),
     handle(handle_in),
     meta(metadata_in, metadata_len_in),
     data(data_in),
@@ -95,8 +98,8 @@ std::queue<request> queue;
 std::mutex mtx;
 std::condition_variable cv;
 
-void receive_request() {
-    request req;
+bool receive_request() {
+    auto req = request(false);
     { // receive request
         std::unique_lock<std::mutex> lock{mtx};
         if (queue.empty()) {
@@ -108,18 +111,26 @@ void receive_request() {
         queue.pop();
     }
 
+    if (req.poisoned) {
+        return true;
+    }
+
+    std::cerr << "CPP handler received request" << std::endl;
+
     // prepare response
     std::string msg = "Hello from C++, your request was received on path: [" + req.meta.uri + "]\n";
     char* resp_data = static_cast<char*>(std::malloc(msg.length()));
     std::memcpy(resp_data, msg.data(), msg.length());
     nlohmann::json headers_json;
-    headers_json["X--Custom-CPP-Header"] = "foo";
+    headers_json["X-Custom-CPP-Header"] = "foo";
     std::string headers = headers_json.dump();
 
     // send response
     send_response(req.handle, 200,
             headers.data(), static_cast<int>(headers.length()),
             resp_data, static_cast<int>(msg.length()));
+
+    return false;
 }
 
 } // namespace
@@ -135,8 +146,12 @@ int bch_initialize(bch_send_response_type response_callback,
 
     th = std::thread([]{
         for(;;) {
-            receive_request();
+            bool shutdown = receive_request();
+            if (shutdown) {
+                break;
+            }
         }
+        std::cerr << "CPP handler worker thread exit" << std::endl;
     });
     th.detach();
 
@@ -154,7 +169,6 @@ int bch_receive_request(void* handle,
         const char* metadata, int metadata_len,
         const char* data, int data_len) {
 
-    std::cerr << "CPP handler received a request" << std::endl;
     request req = request(handle, metadata, metadata_len, data, data_len);
 
     std::lock_guard<std::mutex> guard{mtx};
@@ -170,4 +184,16 @@ __declspec( dllexport )
 #endif // _WIN32
 void bch_free_response_data(void* data) {
     std::free(data);
+}
+
+extern "C"
+#ifdef _WIN32
+__declspec( dllexport )
+#endif // _WIN32
+void bch_shutdown() {
+    std::lock_guard<std::mutex> guard{mtx};
+    auto req = request(true);
+    queue.push(std::move(req));
+    cv.notify_all();
+    std::cerr << "CPP handler shutdown complete" << std::endl;
 }
